@@ -57,6 +57,7 @@ def _make_scheduler_output(
     """Minimal SchedulerOutput stub — no spec-decode tokens."""
     return SimpleNamespace(
         scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=None,
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
         total_num_scheduled_tokens=len(req_ids),
         scheduled_new_reqs=[],
@@ -580,7 +581,18 @@ class TestSampleTokensGrammarPagedPath:
             scheduler_output=scheduler_output,
             logits=logits,
             cu_seqlens=[0, 1],
-            num_decode=1,
+            decode_segments=(
+                mr.PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(1,),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=0,
+                    block_ids=(),
+                ),
+            ),
+            num_decode_tokens=1,
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)
