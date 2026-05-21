@@ -430,12 +430,44 @@ class MetalModelRunner:
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
         backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_states()
+        mx.eval(*self._gdn_updated_state_arrays())
+
+    def _gdn_updated_state_arrays(self) -> list[mx.array]:
+        """Return GDN state arrays updated by a hybrid forward pass.
+
+        Each GDN layer updates conv and recurrent state either in the stable
+        pool or in a compact pending handoff that the next lazy decode can
+        consume directly.  MLX evaluation is array-granular, so submit the
+        currently authoritative state arrays for each layer: compact pending
+        updates when present, otherwise the stable pools.
+        """
+
+        backend = self._paged_attention_backend
         if not isinstance(backend, HybridPagedAttentionBackend):
             raise RuntimeError("GDN state cache requires hybrid paged backend")
         sc = backend._state_cache
         if sc is None:
             raise RuntimeError("GDN state cache is not initialized")
-        mx.eval(*sc.conv_states, *sc.recurrent_states)
+        return sc.updated_state_arrays()
+
+    def _submit_paged_forward_outputs(
+        self,
+        logits: mx.array,
+        *,
+        has_prefill: bool,
+        target_hidden_states: mx.array | None = None,
+    ) -> None:
+        """Submit logits, hidden states, and GDN state side effects."""
+        outputs = [logits]
+        if target_hidden_states is not None:
+            outputs.append(target_hidden_states)
+        if has_prefill and isinstance(
+            self._paged_attention_backend, HybridPagedAttentionBackend
+        ):
+            outputs.extend(self._gdn_updated_state_arrays())
+        mx.async_eval(*outputs)
 
     def _gdn_release_slots(self, req_ids: set[str]) -> None:
         """Release finished GDN slots and defer state materialization."""
@@ -448,6 +480,9 @@ class MetalModelRunner:
         if not freed_slots:
             return
 
+        backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_states()
         self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
 
@@ -914,11 +949,15 @@ class MetalModelRunner:
         finally:
             clear_context()
 
-        # Submit to GPU — returns immediately, GPU runs in background
-        if target_hidden_states is not None:
-            mx.async_eval(logits, target_hidden_states)
-        else:
-            mx.async_eval(logits)
+        # Submit to GPU — returns immediately, GPU runs in background.
+        # For GDN prefill, state-cache updates are side effects that the logits
+        # graph does not necessarily force. Submit them with logits and any
+        # target hidden states retained for assistant decoding.
+        self._submit_paged_forward_outputs(
+            logits,
+            target_hidden_states=target_hidden_states,
+            has_prefill=bool(prefill_reqs),
+        )
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
